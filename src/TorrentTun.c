@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -20,6 +21,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef GIT_COMMIT_STR
+#define GIT_COMMIT_STR "dev"
+#endif
+
 #define TORRENTTUN_VERSION "1.0.0 " GIT_COMMIT_STR
 
 #define SERVER_MODE 0
@@ -32,7 +37,7 @@
 
 #define MAX_ERRNO 4096
 #define MAX_PACKET_SIZE 65535
-#define MAX_PAYLOAD_SIZE 4096
+#define DEFAULT_MAX_PAYLOAD_SIZE 4096
 
 #define PROTO_PSTR "BitTorrent protocol"
 #define PROTO_PSTRLEN 19
@@ -51,12 +56,12 @@
 #define NONCE_SIZE 12
 #define TAG_SIZE 16
 
-#define PRINT_TS()                                                                          \
-    do {                                                                                    \
-        time_t now_ts = time(NULL);                                                         \
-        struct tm tm_now;                                                                   \
-        localtime_r(&now_ts, &tm_now);                                                      \
-        fprintf(stderr, "[%02d:%02d:%02d] ", tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec); \
+#define PRINT_TS_TO(fp)                                                                   \
+    do {                                                                                  \
+        time_t now_ts = time(NULL);                                                       \
+        struct tm tm_now;                                                                 \
+        localtime_r(&now_ts, &tm_now);                                                    \
+        fprintf((fp), "[%02d:%02d:%02d] ", tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec); \
     } while (0)
 
 /* ===================== netaddr ===================== */
@@ -147,33 +152,18 @@ static int32_t netaddr_equal(const netaddr_t *a, const netaddr_t *b)
     return 0;
 }
 
-static int32_t netaddr_from_ip_port(const char *ip, uint16_t port, netaddr_t *out)
+static int32_t netaddr_is_unspecified(const netaddr_t *a)
 {
-    struct sockaddr_in sa4;
-    memset(&sa4, 0, sizeof(sa4));
-    sa4.sin_family = AF_INET;
-    sa4.sin_port = htons(port);
-
-    if (inet_pton(AF_INET, ip, &sa4.sin_addr) == 1) {
-        netaddr_clear(out);
-        memcpy(&out->ss, &sa4, sizeof(sa4));
-        out->len = sizeof(sa4);
-        return 0;
+    if (netaddr_family(a) == AF_INET) {
+        return ((const struct sockaddr_in *)&a->ss)->sin_addr.s_addr == htonl(INADDR_ANY);
     }
 
-    struct sockaddr_in6 sa6;
-    memset(&sa6, 0, sizeof(sa6));
-    sa6.sin6_family = AF_INET6;
-    sa6.sin6_port = htons(port);
-
-    if (inet_pton(AF_INET6, ip, &sa6.sin6_addr) == 1) {
-        netaddr_clear(out);
-        memcpy(&out->ss, &sa6, sizeof(sa6));
-        out->len = sizeof(sa6);
-        return 0;
+    if (netaddr_family(a) == AF_INET6) {
+        static const struct in6_addr zero = IN6ADDR_ANY_INIT;
+        return memcmp(&((const struct sockaddr_in6 *)&a->ss)->sin6_addr, &zero, sizeof(zero)) == 0;
     }
 
-    return -EINVAL;
+    return 1;
 }
 
 static const void *netaddr_addr_ptr(const netaddr_t *a)
@@ -228,6 +218,104 @@ static void netaddr_to_string(const netaddr_t *a, char *buf, size_t buflen)
     }
 }
 
+static int32_t parse_addrport(const char *val, netaddr_t *out)
+{
+    char *tmp = strdup(val);
+    if (!tmp) {
+        return -ENOMEM;
+    }
+
+    char *s = tmp;
+    while (*s && isspace((unsigned char)*s)) {
+        s++;
+    }
+
+    if (*s == 0) {
+        free(tmp);
+        return -EINVAL;
+    }
+
+    char *end = s + strlen(s) - 1;
+    while (end >= s && isspace((unsigned char)*end)) {
+        *end-- = 0;
+    }
+
+    char *host = NULL;
+    char *port_str = NULL;
+
+    if (*s == '[') {
+        char *rb = strchr(s, ']');
+        if (!rb || rb[1] != ':') {
+            free(tmp);
+            return -EINVAL;
+        }
+        *rb = 0;
+        host = s + 1;
+        port_str = rb + 2;
+    } else {
+        char *first = strchr(s, ':');
+        char *last = strrchr(s, ':');
+
+        if (!first || first != last) {
+            free(tmp);
+            return -EINVAL;
+        }
+
+        *last = 0;
+        host = s;
+        port_str = last + 1;
+    }
+
+    while (*host && isspace((unsigned char)*host)) {
+        host++;
+    }
+    while (*port_str && isspace((unsigned char)*port_str)) {
+        port_str++;
+    }
+
+    if (*host == 0 || *port_str == 0) {
+        free(tmp);
+        return -EINVAL;
+    }
+
+    char *endp = NULL;
+    errno = 0;
+    long port = strtol(port_str, &endp, 10);
+    if (errno != 0 || endp == port_str || *endp != 0 || port <= 0 || port > 65535) {
+        free(tmp);
+        return -EINVAL;
+    }
+
+    struct sockaddr_in sa4;
+    memset(&sa4, 0, sizeof(sa4));
+    sa4.sin_family = AF_INET;
+    sa4.sin_port = htons((uint16_t)port);
+
+    if (inet_pton(AF_INET, host, &sa4.sin_addr) == 1) {
+        netaddr_clear(out);
+        memcpy(&out->ss, &sa4, sizeof(sa4));
+        out->len = sizeof(sa4);
+        free(tmp);
+        return 0;
+    }
+
+    struct sockaddr_in6 sa6;
+    memset(&sa6, 0, sizeof(sa6));
+    sa6.sin6_family = AF_INET6;
+    sa6.sin6_port = htons((uint16_t)port);
+
+    if (inet_pton(AF_INET6, host, &sa6.sin6_addr) == 1) {
+        netaddr_clear(out);
+        memcpy(&out->ss, &sa6, sizeof(sa6));
+        out->len = sizeof(sa6);
+        free(tmp);
+        return 0;
+    }
+
+    free(tmp);
+    return -EINVAL;
+}
+
 /* ===================== stats ===================== */
 
 typedef struct {
@@ -272,6 +360,62 @@ static data_stat_t data_stat;
         data_stat.prefix##_bytes += (uint64_t)(len); \
     } while (0)
 
+#define PRINT_DATA_STAT(fp, prefix)                                                       \
+    do {                                                                                  \
+        if (data_stat.prefix##_ptks != 0) {                                               \
+            fprintf((fp), "  " #prefix "_ptks %" PRIu64 "\n", data_stat.prefix##_ptks);   \
+        }                                                                                 \
+        if (data_stat.prefix##_bytes != 0) {                                              \
+            fprintf((fp), "  " #prefix "_bytes %" PRIu64 "\n", data_stat.prefix##_bytes); \
+        }                                                                                 \
+    } while (0)
+
+#define PRINT_ERRNO_STAT(fp, arr_field)                                           \
+    do {                                                                          \
+        for (int32_t e = 1; e < MAX_ERRNO; e++) {                                 \
+            if (errors_stat.arr_field[e] != 0) {                                  \
+                fprintf((fp), "  " #arr_field " errno=%d count=%" PRIu64 "\n", e, \
+                        errors_stat.arr_field[e]);                                \
+            }                                                                     \
+        }                                                                         \
+    } while (0)
+
+/* ===================== config ===================== */
+
+typedef struct {
+    int32_t have_input_listen;
+    netaddr_t input_listen_addr;
+
+    int32_t have_input_target;
+    netaddr_t input_target_addr;
+
+    int32_t have_peer_listen;
+    netaddr_t peer_listen_addr;
+
+    int32_t have_peer_endpoint;
+    netaddr_t peer_endpoint_addr;
+
+    int32_t have_log_path;
+    char *log_path;
+
+    int32_t have_stat_path;
+    char *stat_path;
+
+    int32_t have_psk;
+    uint8_t pre_shared_key[KEY_SIZE];
+
+    int32_t have_info_hash;
+    uint8_t info_hash[INFO_HASH_SIZE];
+
+    int32_t have_peer_id_prefix;
+    char peer_id_prefix[9];
+
+    int32_t have_max_payload_size;
+    size_t max_payload_size;
+} torrenttun_config_t;
+
+static torrenttun_config_t cfg_global;
+
 /* ===================== runtime ===================== */
 
 typedef struct {
@@ -280,14 +424,12 @@ typedef struct {
     int32_t input_sock;
     int32_t peer_sock;
 
-    netaddr_t input_bind_addr;
-    netaddr_t peer_bind_addr;
+    netaddr_t input_listen_addr;
+    netaddr_t input_target_addr;
+    netaddr_t peer_listen_addr;
 
     netaddr_t peer_remote_addr;
     int32_t have_peer_remote;
-
-    netaddr_t input_peer_addr;
-    int32_t have_input_peer;
 
     uint8_t info_hash[INFO_HASH_SIZE];
     uint8_t peer_id[PEER_ID_SIZE];
@@ -306,9 +448,13 @@ typedef struct {
 
     uint8_t key[KEY_SIZE];
     uint8_t nonce_prefix[8];
+
+    size_t max_payload_size;
 } app_t;
 
 static volatile sig_atomic_t exit_flag = 0;
+static FILE *log_file = NULL;
+static FILE *stat_file = NULL;
 
 /* ===================== helpers ===================== */
 
@@ -379,46 +525,432 @@ static void random_bytes_or_die(uint8_t *p, size_t n)
     }
 }
 
-static void init_demo_infohash(uint8_t out[INFO_HASH_SIZE])
+static void hex_encode(const uint8_t *in, size_t n, char *out, size_t out_sz)
 {
-    static const uint8_t demo[INFO_HASH_SIZE] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                                                  0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-                                                  0xff, 0x10, 0x20, 0x30, 0x40, 0x50 };
+    static const char hexd[] = "0123456789abcdef";
 
-    memcpy(out, demo, INFO_HASH_SIZE);
-}
-
-static void init_peer_id(uint8_t out[PEER_ID_SIZE], int32_t role)
-{
-    memset(out, 0, PEER_ID_SIZE);
-
-    if (role == CLIENT_MODE) {
-        memcpy(out, "-BTCLN-000000000000", PEER_ID_SIZE);
-    } else {
-        memcpy(out, "-BTSRV-000000000000", PEER_ID_SIZE);
+    if (out_sz < n * 2 + 1) {
+        if (out_sz > 0) {
+            out[0] = 0;
+        }
+        return;
     }
 
-    random_bytes_or_die(out + 8, PEER_ID_SIZE - 8);
+    for (size_t i = 0; i < n; i++) {
+        out[i * 2 + 0] = hexd[(in[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = hexd[in[i] & 0x0F];
+    }
+
+    out[n * 2] = 0;
 }
 
 static void log_line(const char *fmt, ...)
 {
     va_list args;
 
-    PRINT_TS();
-
+    PRINT_TS_TO(stderr);
     va_start(args, fmt);
     vfprintf(stderr, fmt, args);
     va_end(args);
-
     fprintf(stderr, "\n");
+
+    if (log_file) {
+        PRINT_TS_TO(log_file);
+        va_start(args, fmt);
+        vfprintf(log_file, fmt, args);
+        va_end(args);
+        fprintf(log_file, "\n");
+    }
+}
+
+static char *trim(char *s)
+{
+    while (*s && isspace((unsigned char)*s)) {
+        s++;
+    }
+
+    if (*s == 0) {
+        return s;
+    }
+
+    char *e = s + strlen(s) - 1;
+    while (e > s && isspace((unsigned char)*e)) {
+        *e-- = 0;
+    }
+
+    return s;
+}
+
+static void strip_comment(char *s)
+{
+    for (; *s; s++) {
+        if (*s == '#' || *s == ';') {
+            *s = 0;
+            return;
+        }
+    }
+}
+
+static int32_t set_string(char **dst, const char *src)
+{
+    char *p = strdup(src);
+    if (!p) {
+        return -ENOMEM;
+    }
+
+    free(*dst);
+    *dst = p;
+    return 0;
+}
+
+static int32_t parse_hex_exact(const char *src, uint8_t *out, size_t out_len)
+{
+    size_t src_len = strlen(src);
+    if (src_len != out_len * 2) {
+        return -EINVAL;
+    }
+
+    for (size_t i = 0; i < out_len; i++) {
+        char a = src[i * 2 + 0];
+        char b = src[i * 2 + 1];
+
+        int hi = isdigit((unsigned char)a)  ? a - '0' :
+                 isxdigit((unsigned char)a) ? (tolower((unsigned char)a) - 'a' + 10) :
+                                              -1;
+        int lo = isdigit((unsigned char)b)  ? b - '0' :
+                 isxdigit((unsigned char)b) ? (tolower((unsigned char)b) - 'a' + 10) :
+                                              -1;
+        if (hi < 0 || lo < 0) {
+            return -EINVAL;
+        }
+
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+
+    return 0;
+}
+
+static void cfg_init(torrenttun_config_t *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->max_payload_size = DEFAULT_MAX_PAYLOAD_SIZE;
+}
+
+static void cfg_free(torrenttun_config_t *cfg)
+{
+    free(cfg->log_path);
+    free(cfg->stat_path);
+    cfg_init(cfg);
+}
+
+static int32_t apply_interface_kv(torrenttun_config_t *cfg, const char *key, const char *val)
+{
+    if (strcmp(key, "InputListen") == 0) {
+        if (cfg->have_input_listen) {
+            return -EEXIST;
+        }
+
+        int32_t rc = parse_addrport(val, &cfg->input_listen_addr);
+        if (rc == 0) {
+            if (netaddr_is_unspecified(&cfg->input_listen_addr)) {
+                return -EINVAL;
+            }
+            cfg->have_input_listen = 1;
+        }
+        return rc;
+    }
+
+    if (strcmp(key, "InputTarget") == 0) {
+        if (cfg->have_input_target) {
+            return -EEXIST;
+        }
+
+        int32_t rc = parse_addrport(val, &cfg->input_target_addr);
+        if (rc == 0) {
+            if (netaddr_is_unspecified(&cfg->input_target_addr)) {
+                return -EINVAL;
+            }
+            cfg->have_input_target = 1;
+        }
+        return rc;
+    }
+
+    if (strcmp(key, "PeerListen") == 0) {
+        if (cfg->have_peer_listen) {
+            return -EEXIST;
+        }
+
+        int32_t rc = parse_addrport(val, &cfg->peer_listen_addr);
+        if (rc == 0) {
+            if (netaddr_is_unspecified(&cfg->peer_listen_addr)) {
+                return -EINVAL;
+            }
+            cfg->have_peer_listen = 1;
+        }
+        return rc;
+    }
+
+    if (strcmp(key, "PeerEndpoint") == 0) {
+        if (cfg->have_peer_endpoint) {
+            return -EEXIST;
+        }
+
+        int32_t rc = parse_addrport(val, &cfg->peer_endpoint_addr);
+        if (rc == 0) {
+            if (netaddr_is_unspecified(&cfg->peer_endpoint_addr)) {
+                return -EINVAL;
+            }
+            cfg->have_peer_endpoint = 1;
+        }
+        return rc;
+    }
+
+    if (strcmp(key, "LogPath") == 0) {
+        if (cfg->have_log_path) {
+            return -EEXIST;
+        }
+
+        int32_t rc = set_string(&cfg->log_path, trim((char *)val));
+        if (rc == 0 && cfg->log_path && cfg->log_path[0] != 0) {
+            cfg->have_log_path = 1;
+            return 0;
+        }
+        return -EINVAL;
+    }
+
+    if (strcmp(key, "StatPath") == 0) {
+        if (cfg->have_stat_path) {
+            return -EEXIST;
+        }
+
+        int32_t rc = set_string(&cfg->stat_path, trim((char *)val));
+        if (rc == 0 && cfg->stat_path && cfg->stat_path[0] != 0) {
+            cfg->have_stat_path = 1;
+            return 0;
+        }
+        return -EINVAL;
+    }
+
+    if (strcmp(key, "PreSharedKey") == 0) {
+        if (cfg->have_psk) {
+            return -EEXIST;
+        }
+
+        int32_t rc = parse_hex_exact(val, cfg->pre_shared_key, KEY_SIZE);
+        if (rc == 0) {
+            cfg->have_psk = 1;
+        }
+        return rc;
+    }
+
+    if (strcmp(key, "InfoHash") == 0) {
+        if (cfg->have_info_hash) {
+            return -EEXIST;
+        }
+
+        int32_t rc = parse_hex_exact(val, cfg->info_hash, INFO_HASH_SIZE);
+        if (rc == 0) {
+            cfg->have_info_hash = 1;
+        }
+        return rc;
+    }
+
+    if (strcmp(key, "PeerIdPrefix") == 0) {
+        if (cfg->have_peer_id_prefix) {
+            return -EEXIST;
+        }
+
+        size_t n = strlen(val);
+        if (n == 0 || n > 8) {
+            return -EINVAL;
+        }
+
+        memset(cfg->peer_id_prefix, 0, sizeof(cfg->peer_id_prefix));
+        memcpy(cfg->peer_id_prefix, val, n);
+        cfg->have_peer_id_prefix = 1;
+        return 0;
+    }
+
+    if (strcmp(key, "MaxPayloadSize") == 0) {
+        if (cfg->have_max_payload_size) {
+            return -EEXIST;
+        }
+
+        char *endp = NULL;
+        errno = 0;
+        unsigned long v = strtoul(val, &endp, 10);
+        if (errno != 0 || endp == val || *endp != 0) {
+            return -EINVAL;
+        }
+
+        if (v == 0 || v > MAX_PACKET_SIZE - 128) {
+            return -EINVAL;
+        }
+
+        cfg->max_payload_size = (size_t)v;
+        cfg->have_max_payload_size = 1;
+        return 0;
+    }
+
+    return -EINVAL;
+}
+
+static int32_t torrenttun_config_load_file(torrenttun_config_t *cfg, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return -errno;
+    }
+
+    cfg_free(cfg);
+    cfg_init(cfg);
+
+    enum { SEC_NONE = 0, SEC_INTERFACE = 1 } sec = SEC_NONE;
+    int32_t seen_interface = 0;
+
+    char line[1024];
+    uint32_t lineno = 0;
+    int32_t rc = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+
+        line[strcspn(line, "\r\n")] = 0;
+        strip_comment(line);
+
+        char *s = trim(line);
+        if (*s == 0) {
+            continue;
+        }
+
+        if (strcmp(s, "[Interface]") == 0) {
+            if (seen_interface) {
+                rc = -EEXIST;
+                break;
+            }
+            seen_interface = 1;
+            sec = SEC_INTERFACE;
+            continue;
+        }
+
+        char *eq = strchr(s, '=');
+        if (!eq) {
+            rc = -EINVAL;
+            break;
+        }
+
+        *eq = 0;
+        char *key = trim(s);
+        char *val = trim(eq + 1);
+
+        if (*key == 0 || *val == 0) {
+            rc = -EINVAL;
+            break;
+        }
+
+        if (sec != SEC_INTERFACE) {
+            rc = -EINVAL;
+            break;
+        }
+
+        rc = apply_interface_kv(cfg, key, val);
+        if (rc != 0) {
+            break;
+        }
+    }
+
+    fclose(f);
+
+    if (rc != 0) {
+        cfg_free(cfg);
+
+        if (rc == -EEXIST) {
+            fprintf(stderr, "config parse error: %s:%u duplicate key or section\n", path, lineno);
+        } else {
+            fprintf(stderr, "config parse error: %s:%u rc=%d\n", path, lineno, rc);
+        }
+    }
+
+    return rc;
+}
+
+static void cfg_print_addr(const char *name, int32_t have, const netaddr_t *a)
+{
+    if (!have) {
+        fprintf(stderr, "%s: (not set)\n", name);
+        return;
+    }
+
+    char full[128];
+    netaddr_to_string(a, full, sizeof(full));
+    fprintf(stderr, "%s: %s\n", name, full);
+}
+
+static void cfg_print_str(const char *name, int32_t have, const char *s)
+{
+    if (!have || !s) {
+        fprintf(stderr, "%s: (not set)\n", name);
+        return;
+    }
+
+    fprintf(stderr, "%s: %s\n", name, s);
+}
+
+static void cfg_print_hex(const char *name, int32_t have, const uint8_t *p, size_t n)
+{
+    if (!have) {
+        fprintf(stderr, "%s: (not set)\n", name);
+        return;
+    }
+
+    char buf[256];
+    hex_encode(p, n, buf, sizeof(buf));
+    fprintf(stderr, "%s: %s\n", name, buf);
+}
+
+static void torrenttun_config_log(const torrenttun_config_t *cfg)
+{
+    cfg_print_addr("InputListen", cfg->have_input_listen, &cfg->input_listen_addr);
+    cfg_print_addr("InputTarget", cfg->have_input_target, &cfg->input_target_addr);
+    cfg_print_addr("PeerListen", cfg->have_peer_listen, &cfg->peer_listen_addr);
+    cfg_print_addr("PeerEndpoint", cfg->have_peer_endpoint, &cfg->peer_endpoint_addr);
+
+    cfg_print_hex("PreSharedKey", cfg->have_psk, cfg->pre_shared_key, KEY_SIZE);
+    cfg_print_hex("InfoHash", cfg->have_info_hash, cfg->info_hash, INFO_HASH_SIZE);
+
+    if (cfg->have_peer_id_prefix) {
+        fprintf(stderr, "PeerIdPrefix: %s\n", cfg->peer_id_prefix);
+    } else {
+        fprintf(stderr, "PeerIdPrefix: (default)\n");
+    }
+
+    fprintf(stderr, "MaxPayloadSize: %zu\n", cfg->max_payload_size);
+    cfg_print_str("LogPath", cfg->have_log_path, cfg->log_path);
+    cfg_print_str("StatPath", cfg->have_stat_path, cfg->stat_path);
+}
+
+/* ===================== peer id ===================== */
+
+static void init_peer_id(uint8_t out[PEER_ID_SIZE], int32_t role, const torrenttun_config_t *cfg)
+{
+    memset(out, 0, PEER_ID_SIZE);
+
+    if (cfg->have_peer_id_prefix) {
+        size_t n = strlen(cfg->peer_id_prefix);
+        memcpy(out, cfg->peer_id_prefix, n);
+    } else if (role == CLIENT_MODE) {
+        memcpy(out, "-BTCLN-", 7);
+    } else {
+        memcpy(out, "-BTSRV-", 7);
+    }
+
+    random_bytes_or_die(out + 8, PEER_ID_SIZE - 8);
 }
 
 /* ===================== crypto ===================== */
 
 static int32_t crypto_init(app_t *app)
 {
-    memset(app->key, 0x42, sizeof(app->key));
     random_bytes_or_die(app->nonce_prefix, sizeof(app->nonce_prefix));
 
     app->enc_ctx = EVP_CIPHER_CTX_new();
@@ -832,12 +1364,6 @@ static void handle_peer_packet(app_t *app)
             return;
         }
 
-        if (!app->have_input_peer) {
-            log_line("dropped decrypted packet: local input peer is unknown");
-            STAT_ADD(drop_peer, n);
-            return;
-        }
-
         if (app->rx_packets_mark != 0 && begin_seq < app->recv_seq) {
             log_line("received old seq=%" PRIu32 " last=%" PRIu32, begin_seq, app->recv_seq);
         }
@@ -845,7 +1371,7 @@ static void handle_peer_packet(app_t *app)
         app->recv_seq = begin_seq;
         app->rx_packets_mark = 1;
 
-        int32_t rc = sendto_addr(app->input_sock, plain, plain_len, &app->input_peer_addr);
+        int32_t rc = sendto_addr(app->input_sock, plain, plain_len, &app->input_target_addr);
         if (rc != 0) {
             errno = -rc;
             ERRNO_ADD(sendto_input);
@@ -868,13 +1394,13 @@ static void handle_peer_packet(app_t *app)
 
 static void handle_input_packet(app_t *app)
 {
-    uint8_t plain[MAX_PAYLOAD_SIZE];
+    uint8_t plain[MAX_PACKET_SIZE];
     struct sockaddr_storage from;
     socklen_t from_len = sizeof(from);
     memset(&from, 0, sizeof(from));
 
-    ssize_t n =
-        recvfrom(app->input_sock, plain, sizeof(plain), 0, (struct sockaddr *)&from, &from_len);
+    ssize_t n = recvfrom(app->input_sock, plain, app->max_payload_size, 0, (struct sockaddr *)&from,
+                         &from_len);
 
     if (n < 0) {
         ERRNO_ADD(recvfrom_input);
@@ -882,27 +1408,6 @@ static void handle_input_packet(app_t *app)
     }
 
     STAT_ADD(recvfrom_input, n);
-
-    netaddr_t from_addr;
-    if (netaddr_from_sockaddr(&from_addr, (struct sockaddr *)&from, from_len) != 0) {
-        STAT_ADD(drop_input, n);
-        return;
-    }
-
-    if (!app->have_input_peer) {
-        netaddr_copy(&app->input_peer_addr, &from_addr);
-        app->have_input_peer = 1;
-
-        char full[128];
-        netaddr_to_string(&app->input_peer_addr, full, sizeof(full));
-        log_line("input peer learned: %s", full);
-    } else if (!netaddr_equal(&app->input_peer_addr, &from_addr)) {
-        netaddr_copy(&app->input_peer_addr, &from_addr);
-
-        char full[128];
-        netaddr_to_string(&app->input_peer_addr, full, sizeof(full));
-        log_line("input peer updated: %s", full);
-    }
 
     if (!app->have_peer_remote) {
         log_line("input packet dropped: remote peer address is unknown");
@@ -954,34 +1459,66 @@ static void handle_input_packet(app_t *app)
     log_line("sent piece index=%d begin(seq)=%" PRIu32 " bytes=%zd", PIECE_INDEX_DATA, seq, n);
 }
 
+/* ===================== stats print ===================== */
+
+static void stat_print(void)
+{
+    FILE *fp = stat_file ? stat_file : stderr;
+
+    if (stat_file) {
+        if (ftruncate(fileno(stat_file), 0) != 0) {
+            return;
+        }
+        fseek(stat_file, 0, SEEK_SET);
+    }
+
+    fprintf(fp, "errnos:\n");
+    PRINT_ERRNO_STAT(fp, sendto_input);
+    PRINT_ERRNO_STAT(fp, sendto_peer);
+    PRINT_ERRNO_STAT(fp, recvfrom_input);
+    PRINT_ERRNO_STAT(fp, recvfrom_peer);
+    fprintf(fp, "\n");
+
+    fprintf(fp, "data:\n");
+    PRINT_DATA_STAT(fp, recvfrom_input);
+    PRINT_DATA_STAT(fp, recvfrom_peer);
+    PRINT_DATA_STAT(fp, sendto_input);
+    PRINT_DATA_STAT(fp, sendto_peer);
+    PRINT_DATA_STAT(fp, drop_input);
+    PRINT_DATA_STAT(fp, drop_peer);
+    fprintf(fp, "\n");
+
+    fflush(fp);
+}
+
 /* ===================== print ===================== */
 
 static void print_usage(const char *prog)
 {
-    fprintf(stderr,
-            "Usage:\n"
-            "  %s client <input_bind_ip> <input_bind_port> "
-            "<peer_bind_ip> <peer_bind_port> <peer_ip> <peer_port>\n"
-            "  %s server <input_bind_ip> <input_bind_port> "
-            "<peer_bind_ip> <peer_bind_port> [peer_ip peer_port]\n",
-            prog, prog);
+    fprintf(stderr, "Usage:\n  %s <config.conf>\n", prog);
 }
 
-static void print_config(const app_t *app)
+static void print_runtime_config(const app_t *app)
 {
     char a1[128];
     char a2[128];
+    char a3[128];
 
-    netaddr_to_string(&app->input_bind_addr, a1, sizeof(a1));
-    netaddr_to_string(&app->peer_bind_addr, a2, sizeof(a2));
+    netaddr_to_string(&app->input_listen_addr, a1, sizeof(a1));
+    netaddr_to_string(&app->input_target_addr, a2, sizeof(a2));
+    netaddr_to_string(&app->peer_listen_addr, a3, sizeof(a3));
 
-    fprintf(stderr, "input bind: %s\n", a1);
-    fprintf(stderr, "peer  bind: %s\n", a2);
+    fprintf(stderr, "role: %s\n", app->role == CLIENT_MODE ? "client" : "server");
+    fprintf(stderr, "input listen: %s\n", a1);
+    fprintf(stderr, "input target: %s\n", a2);
+    fprintf(stderr, "peer  listen: %s\n", a3);
 
     if (app->have_peer_remote) {
-        char a3[128];
-        netaddr_to_string(&app->peer_remote_addr, a3, sizeof(a3));
-        fprintf(stderr, "peer remote: %s\n", a3);
+        char a4[128];
+        netaddr_to_string(&app->peer_remote_addr, a4, sizeof(a4));
+        fprintf(stderr, "peer endpoint: %s\n", a4);
+    } else {
+        fprintf(stderr, "peer endpoint: (learn from first peer packet)\n");
     }
 }
 
@@ -1001,74 +1538,104 @@ int32_t main(int32_t argc, char **argv)
         errmsg("Can't set SIGTERM handler\n");
     }
 
-    if (argc != 6 && argc != 8) {
+    if (signal(SIGHUP, main_catch_function) == SIG_ERR) {
+        errmsg("Can't set SIGHUP handler\n");
+    }
+
+    if (argc != 2) {
         print_usage(argv[0]);
         return 1;
+    }
+
+    cfg_init(&cfg_global);
+
+    if (torrenttun_config_load_file(&cfg_global, argv[1]) != 0) {
+        errmsg("Config parse failed\n");
+    }
+
+    torrenttun_config_log(&cfg_global);
+
+    if (!cfg_global.have_input_listen) {
+        errmsg("InputListen is required\n");
+    }
+
+    if (!cfg_global.have_input_target) {
+        errmsg("InputTarget is required\n");
+    }
+
+    if (!cfg_global.have_peer_listen) {
+        errmsg("PeerListen is required\n");
+    }
+
+    if (!cfg_global.have_psk) {
+        errmsg("PreSharedKey is required\n");
+    }
+
+    if (!cfg_global.have_info_hash) {
+        errmsg("InfoHash is required\n");
+    }
+
+    int32_t work_mode = cfg_global.have_peer_endpoint ? CLIENT_MODE : SERVER_MODE;
+
+    fprintf(stderr, "%s mode\n", work_mode == CLIENT_MODE ? "Client" : "Server");
+
+    if (cfg_global.have_log_path) {
+        log_file = fopen(cfg_global.log_path, "w");
+        if (!log_file) {
+            errmsg("Can't open LogPath\n");
+        }
+    }
+
+    if (cfg_global.have_stat_path) {
+        stat_file = fopen(cfg_global.stat_path, "w");
+        if (!stat_file) {
+            errmsg("Can't open StatPath\n");
+        }
     }
 
     app_t app;
     memset(&app, 0, sizeof(app));
 
+    app.role = work_mode;
     app.input_sock = -1;
     app.peer_sock = -1;
+    app.max_payload_size = cfg_global.max_payload_size;
 
-    if (strcmp(argv[1], "client") == 0) {
-        if (argc != 8) {
-            print_usage(argv[0]);
-            return 1;
-        }
+    netaddr_copy(&app.input_listen_addr, &cfg_global.input_listen_addr);
+    netaddr_copy(&app.input_target_addr, &cfg_global.input_target_addr);
+    netaddr_copy(&app.peer_listen_addr, &cfg_global.peer_listen_addr);
 
-        app.role = CLIENT_MODE;
-    } else if (strcmp(argv[1], "server") == 0) {
-        if (argc != 6 && argc != 8) {
-            print_usage(argv[0]);
-            return 1;
-        }
-
-        app.role = SERVER_MODE;
-    } else {
-        print_usage(argv[0]);
-        return 1;
-    }
-
-    if (netaddr_from_ip_port(argv[2], (uint16_t)atoi(argv[3]), &app.input_bind_addr) != 0) {
-        errmsg("Invalid input bind address\n");
-    }
-
-    if (netaddr_from_ip_port(argv[4], (uint16_t)atoi(argv[5]), &app.peer_bind_addr) != 0) {
-        errmsg("Invalid peer bind address\n");
-    }
-
-    if (argc == 8) {
-        if (netaddr_from_ip_port(argv[6], (uint16_t)atoi(argv[7]), &app.peer_remote_addr) != 0) {
-            errmsg("Invalid peer remote address\n");
-        }
-
+    if (cfg_global.have_peer_endpoint) {
+        netaddr_copy(&app.peer_remote_addr, &cfg_global.peer_endpoint_addr);
         app.have_peer_remote = 1;
     }
 
-    init_demo_infohash(app.info_hash);
-    init_peer_id(app.peer_id, app.role);
+    memcpy(app.key, cfg_global.pre_shared_key, KEY_SIZE);
+    memcpy(app.info_hash, cfg_global.info_hash, INFO_HASH_SIZE);
+
+    init_peer_id(app.peer_id, app.role, &cfg_global);
 
     if (crypto_init(&app) != 0) {
         errmsg("crypto_init failed\n");
     }
 
-    app.input_sock = make_udp_socket_bind(&app.input_bind_addr);
+    app.input_sock = make_udp_socket_bind(&app.input_listen_addr);
     if (app.input_sock < 0) {
         errmsg("Can't create/bind input socket: %s\n", strerror(-app.input_sock));
     }
 
-    app.peer_sock = make_udp_socket_bind(&app.peer_bind_addr);
+    app.peer_sock = make_udp_socket_bind(&app.peer_listen_addr);
     if (app.peer_sock < 0) {
         errmsg("Can't create/bind peer socket: %s\n", strerror(-app.peer_sock));
     }
 
-    print_config(&app);
+    print_runtime_config(&app);
 
     if (app.role == CLIENT_MODE) {
         maybe_send_handshake(&app);
     }
+
+    time_t last_stat_ts = time(NULL);
 
     while (!exit_flag) {
         struct pollfd socks[2];
@@ -1089,18 +1656,32 @@ int32_t main(int32_t argc, char **argv)
             errmsg("poll failed: %s\n", strerror(errno));
         }
 
-        if (rc == 0) {
-            continue;
+        if (rc > 0) {
+            if (socks[1].revents & POLLIN) {
+                handle_peer_packet(&app);
+            }
+
+            if (socks[0].revents & POLLIN) {
+                handle_input_packet(&app);
+            }
         }
 
-        if (socks[1].revents & POLLIN) {
-            handle_peer_packet(&app);
-        }
+        time_t now_ts = time(NULL);
+        if (now_ts != (time_t)-1 && last_stat_ts != (time_t)-1 && now_ts - last_stat_ts >= 10) {
+            stat_print();
 
-        if (socks[0].revents & POLLIN) {
-            handle_input_packet(&app);
+            if (log_file) {
+                fflush(log_file);
+            }
+            if (stat_file) {
+                fflush(stat_file);
+            }
+
+            last_stat_ts = now_ts;
         }
     }
+
+    stat_print();
 
     if (app.enc_ctx) {
         EVP_CIPHER_CTX_free(app.enc_ctx);
@@ -1120,6 +1701,16 @@ int32_t main(int32_t argc, char **argv)
     if (app.peer_sock >= 0) {
         close(app.peer_sock);
     }
+
+    if (log_file) {
+        fclose(log_file);
+    }
+
+    if (stat_file) {
+        fclose(stat_file);
+    }
+
+    cfg_free(&cfg_global);
 
     fprintf(stderr, "TorrentTun finished\n");
     return 0;
