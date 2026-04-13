@@ -20,7 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TorrentTun_VERSION "0.1.0"
+#define TORRENTTUN_VERSION "1.0.0 " GIT_COMMIT_STR
 
 #define SERVER_MODE 0
 #define CLIENT_MODE 1
@@ -990,7 +990,7 @@ static void print_config(const app_t *app)
 int32_t main(int32_t argc, char **argv)
 {
     fprintf(stderr, "--------------------------------------------\n");
-    fprintf(stderr, "TorrentTun " TorrentTun_VERSION "\n");
+    fprintf(stderr, "TorrentTun " TORRENTTUN_VERSION "\n");
     fprintf(stderr, "--------------------------------------------\n");
 
     if (signal(SIGINT, main_catch_function) == SIG_ERR) {
